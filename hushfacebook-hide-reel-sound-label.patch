@@ -1,0 +1,163 @@
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/Settings.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/Settings.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/Settings.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/Settings.java
+@@ -409,6 +409,13 @@
+             new BooleanSetting("hushfacebook_hide_reel_chips", FALSE);
+ 
+     /**
++     * The sound or track label under a reel's caption, including the "Original audio" label.
++     * This only hides the label; it doesn't mute the video or change the audio track.
++     */
++    public static final BooleanSetting HIDE_REEL_SOUND_LABEL =
++            new BooleanSetting("hushfacebook_hide_reel_sound_label", FALSE);
++
++    /**
+      * The Follow button in a reel's author row, through Facebook's own check for offering it, and
+      * the Following button an author you already follow gets there, through its config for
+      * removing that one.
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/reels/ReelDeclutter.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/reels/ReelDeclutter.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/reels/ReelDeclutter.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/reels/ReelDeclutter.java
+@@ -74,6 +74,9 @@
+             "XFBFBShortsExternalLinkAttribution",
+     };
+ 
++    /** The audio/track attribution rendered under a reel's caption. */
++    static final String SOUNDTRACK_TITLE = "XFBFBShortsSoundtrackTitle";
++
+     /** The diagnostic counter routes. */
+     static final String CHIPS_ROUTE = "Reel chips";
+     static final String FOLLOW_ROUTE = "Reel Follow button";
+@@ -136,7 +139,10 @@
+             if (!(chips instanceof List)) return null;
+             List<?> list = (List<?>) chips;
+             FeedFilterCounters.sawList(CHIPS_ROUTE, list.size());
+-            if (list.isEmpty() || !Utils.settingsReady() || !Settings.HIDE_REEL_CHIPS.get()) return null;
++            if (list.isEmpty() || !Utils.settingsReady()) return null;
++            boolean hidePrompts = Settings.HIDE_REEL_CHIPS.get();
++            boolean hideSoundLabel = Settings.HIDE_REEL_SOUND_LABEL.get();
++            if (!hidePrompts && !hideSoundLabel) return null;
+ 
+             List<Object> kept = new ArrayList<>(list.size());
+             for (Object chip : list) {
+@@ -145,7 +151,9 @@
+                 String type = FeedFilter.typeName(chip);
+                 // The report names every chip type a reel carried, which is how a new one is found.
+                 FeedFilterCounters.sawKind(CHIPS_ROUTE, type == null ? UNREADABLE : type);
+-                if (isHiddenChip(type)) {
++                boolean hiddenPrompt = hidePrompts && isHiddenChip(type);
++                boolean hiddenSoundLabel = hideSoundLabel && SOUNDTRACK_TITLE.equals(type);
++                if (hiddenPrompt || hiddenSoundLabel) {
+                     FeedFilterCounters.removed(CHIPS_ROUTE, 1, type);
+                     logOnce("chip " + type, () -> "Reel chips: hid " + type);
+                     continue;
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SwitchLabels.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SwitchLabels.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SwitchLabels.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SwitchLabels.java
+@@ -114,6 +114,7 @@
+         if (setting == Settings.HIDE_SPONSORED_REELS) return L10n.t("Hide sponsored reels");
+         if (setting == Settings.HIDE_AI_DETECTED_REELS) return L10n.t("Hide AI-detected reels and videos");
+         if (setting == Settings.HIDE_REEL_CHIPS) return L10n.t("Hide prompts and promos under reels");
++        if (setting == Settings.HIDE_REEL_SOUND_LABEL) return L10n.t("Hide the sound label on reels");
+         if (setting == Settings.HIDE_REEL_FOLLOW_BUTTON) return L10n.t("Hide the Follow button on reels");
+         if (setting == Settings.HIDE_REEL_SOCIAL_FOOTER) return L10n.t("Hide comment and reaction previews");
+         if (setting == Settings.HIDE_REEL_THREADS_CARDS) return L10n.t("Hide Threads cards between reels");
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/VideoPages.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/VideoPages.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/VideoPages.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/VideoPages.java
+@@ -103,6 +103,9 @@
+             reels.addPreference(toggle(context, Settings.HIDE_REEL_CHIPS,
+                     L10n.t("Hides prompts and promos under reels, like Remix, Use template, Add yours, Edits, Stars, games, "
+                             + "partner apps and outside links. The song label stays.")));
++            reels.addPreference(toggle(context, Settings.HIDE_REEL_SOUND_LABEL,
++                    L10n.t("Hides the sound or track label under a reel's caption, including \"Original audio\". "
++                            + "It doesn't mute the video or change the audio track. Off by default.")));
+             reels.addPreference(toggle(context, Settings.HIDE_REEL_FOLLOW_BUTTON,
+                     L10n.t("The Follow button next to the reel's author. You can still follow them from their profile.")));
+             reels.addPreference(toggle(context, Settings.HIDE_REEL_SOCIAL_FOOTER,
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/PatchFamily.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/PatchFamily.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/PatchFamily.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/PatchFamily.java
+@@ -97,7 +97,8 @@
+     AFFILIATE_LINKS(FamilyNames.AFFILIATE_LINKS, "affiliateLinks", null,
+             Settings.HIDE_AFFILIATE_LINKS),
+     REEL_DECLUTTER(FamilyNames.REEL_DECLUTTER, "reelDeclutter", null,
+-            Settings.HIDE_REEL_CHIPS, Settings.HIDE_REEL_FOLLOW_BUTTON, Settings.HIDE_REEL_SOCIAL_FOOTER,
++            Settings.HIDE_REEL_CHIPS, Settings.HIDE_REEL_SOUND_LABEL,
++            Settings.HIDE_REEL_FOLLOW_BUTTON, Settings.HIDE_REEL_SOCIAL_FOOTER,
+             Settings.HIDE_REEL_THREADS_CARDS, Settings.REEL_CLEAN_MODE, Settings.PLAY_REELS_ONCE,
+             Settings.ORIGINAL_AUDIO, Settings.HIDE_REEL_SEARCH_PILL, Settings.HIDE_REEL_COUNTS,
+             Settings.HIDE_REEL_SAVE_BUTTON, Settings.HIDE_REEL_SOUND_BUTTON, Settings.FEED_VIDEOS_ALONE),
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SettingsBackup.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SettingsBackup.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SettingsBackup.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SettingsBackup.java
+@@ -171,6 +171,7 @@
+             Settings.ANSWER_REWARDED_GAME_ADS,
+             Settings.HIDE_AFFILIATE_LINKS,
+             Settings.HIDE_REEL_CHIPS,
++            Settings.HIDE_REEL_SOUND_LABEL,
+             Settings.HIDE_REEL_FOLLOW_BUTTON,
+             Settings.HIDE_REEL_SOCIAL_FOOTER,
+             Settings.HIDE_REEL_THREADS_CARDS,
+diff --git a/extensions/shared/library/src/main/l10n/tr.tsv b/extensions/shared/library/src/main/l10n/tr.tsv
+--- a/extensions/shared/library/src/main/l10n/tr.tsv
++++ b/extensions/shared/library/src/main/l10n/tr.tsv
+@@ -294,6 +294,8 @@
+ Folder name	Klasör adı
+ Hide prompts and promos under reels	Reels videolarının altındaki davetleri ve tanıtımları gizle
+ Hides prompts and promos under reels, like Remix, Use template, Add yours, Edits, Stars, games, partner apps and outside links. The song label stays.	Reellerin altındaki Remix, Şablonu kullan, Add yours, Edits, Stars, oyunlar, ortak uygulamalar ve dış bağlantılar gibi önerileri ve tanıtımları gizler. Şarkı etiketi kalır.
++Hide the sound label on reels	Reels'teki ses etiketini gizle
++Hides the sound or track label under a reel's caption, including "Original audio". It doesn't mute the video or change the audio track. Off by default.	Reel açıklamasının altındaki "Orijinal ses" dâhil ses veya parça etiketini gizler. Videonun sesini kapatmaz veya çalan ses parçasını değiştirmez. Varsayılan olarak kapalıdır.
+ Hide the Follow button on reels	Reels videolarındaki Takip Et düğmesini gizle
+ The Follow button next to the reel's author. You can still follow them from their profile.	Reels videosunu paylaşan kişinin adının yanındaki Takip Et düğmesi. Onu profilinden yine takip edebilirsin.
+ Hide comment and reaction previews	Yorum ve tepki önizlemelerini gizle
+diff --git a/extensions/facebook/src/test/java/app/morphe/extension/facebook/reels/ReelDeclutterTest.java b/extensions/facebook/src/test/java/app/morphe/extension/facebook/reels/ReelDeclutterTest.java
+--- a/extensions/facebook/src/test/java/app/morphe/extension/facebook/reels/ReelDeclutterTest.java
++++ b/extensions/facebook/src/test/java/app/morphe/extension/facebook/reels/ReelDeclutterTest.java
+@@ -64,6 +64,7 @@
+     public void restore() {
+         PauseForTests.resume();
+         Settings.HIDE_REEL_CHIPS.resetToDefault();
++        Settings.HIDE_REEL_SOUND_LABEL.resetToDefault();
+         Settings.HIDE_REEL_FOLLOW_BUTTON.resetToDefault();
+         Settings.HIDE_REEL_SOCIAL_FOOTER.resetToDefault();
+         Settings.HIDE_REEL_COUNTS.resetToDefault();
+@@ -90,6 +91,7 @@
+     @Test
+     public void everySwitchStartsOff() {
+         assertFalse(Settings.HIDE_REEL_CHIPS.defaultValue);
++        assertFalse(Settings.HIDE_REEL_SOUND_LABEL.defaultValue);
+         assertFalse(Settings.HIDE_REEL_FOLLOW_BUTTON.defaultValue);
+         assertFalse(Settings.HIDE_REEL_SOCIAL_FOOTER.defaultValue);
+     }
+@@ -148,6 +150,18 @@
+         assertEquals(ReelDeclutter.CHIPS_ROUTE + ": 1 lists, 2 items, 0 removed", line(ReelDeclutter.CHIPS_ROUTE));
+     }
+ 
++    /** The sound-label switch removes the soundtrack row without hiding unrelated chips. */
++    @Test
++    public void soundLabelSwitchOnlyHidesTheSoundtrackTitle() {
++        Settings.HIDE_REEL_CHIPS.save(false);
++        Settings.HIDE_REEL_SOUND_LABEL.save(true);
++        TypedFeedUnit remix = chip(REMIX);
++        TypedFeedUnit song = chip(SONG);
++        TypedFeedUnit location = chip(LOCATION);
++        assertArrayEquals(new Object[]{remix, location},
++                ReelDeclutter.filterChips(Arrays.asList(remix, song, location)));
++    }
++
+     /** A list that throws while it's read is kept, and the report names the hook that threw. */
+     @Test
+     public void aListThatThrowsIsKeptAndReported() {
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -94,7 +94,7 @@
+ | `Block screenshot detection` | Stops Facebook noticing when you take a screenshot or record the screen, in the feed, Reels, chats and everywhere else, so it can't react to it. Starts off. Turn it on in Hushfacebook settings > Privacy. |
+ | `Hide typing indicator` | Others don't see that you're typing, in chats that open inside Facebook and in comment boxes, so you can write without anyone watching. Your messages send as usual. Starts off. Turn on the parts you want in Hushfacebook settings > Privacy. |
+ | `Hide read receipts` | People you chat with in chats that open inside Facebook don't see that you've read their messages, so you can read now and reply later. Replying may still show you've read it. Starts off. Turn it on in Hushfacebook settings > Privacy. |
+-| `Clean up Reels` | Hides clutter on reels, such as the Follow button, comment previews, Remix and Use template buttons and Threads cards between reels, so more of the video shows, and can play each reel once instead of over and over, keep its original audio instead of a Meta AI dub, drop the search pill under the caption, or hide the like, comment and share counts, the Save button or the speaker button. It can also open a video you tap in the feed on its own, with no reels after it. Starts off. Turn on the parts you want in Hushfacebook settings > Reels and Watch. |
++| `Clean up Reels` | Hides clutter on reels, such as the Follow button, comment previews, Remix and Use template buttons and Threads cards between reels, so more of the video shows, and can play each reel once instead of over and over, keep its original audio instead of a Meta AI dub, drop the search pill or sound label under the caption, or hide the like, comment and share counts, the Save button or the speaker button. It can also open a video you tap in the feed on its own, with no reels after it. Starts off. Turn on the parts you want in Hushfacebook settings > Reels and Watch. |
+ | `Default playback quality` | Plays videos, reels and video stories at the quality you choose, such as Data saver or up to 720p, instead of what Facebook picks. Lower saves data, higher looks sharper. Starts off. Turn it on and pick a quality in Hushfacebook settings > Playback. |
+ | `Default comment order` | Opens comments in the order you choose, Most relevant, Newest or All comments, instead of the one Facebook picks. Handy if you always want the newest first. Starts off. Turn it on and pick an order in Hushfacebook settings > Comments. |
+ | `Disable Audience Network` | Stops Facebook serving its ads inside other apps on your phone. Those apps show their own ads or none, and their rewarded ads may fail. Works as soon as you patch it in, with no switch. |
