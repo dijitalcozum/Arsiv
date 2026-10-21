@@ -1,0 +1,256 @@
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/Settings.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/Settings.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/Settings.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/Settings.java
+@@ -735,6 +735,14 @@ public class Settings extends BaseSettings {
+     public static final BooleanSetting HIDE_COMMENT_GIF_STICKER_BUTTONS =
+             new BooleanSetting("hushfacebook_hide_comment_gif_sticker_buttons", FALSE);
+ 
++    /**
++     * The comment composer at the bottom of Facebook's full-screen video viewer is omitted from
++     * the viewer's render method ({@link app.morphe.extension.facebook.comments.CommentSheetOptions}).
++     * Comment boxes on ordinary posts are unchanged. Off by default.
++     */
++    public static final BooleanSetting HIDE_VIDEO_COMMENT_COMPOSER =
++            new BooleanSetting("hushfacebook_hide_video_comment_composer", FALSE);
++
+     /**
+      * Every comment starts with its reply thread open, as if View replies had been tapped
+      * ({@link app.morphe.extension.facebook.comments.CommentSheetOptions}). Off by default. A
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/comments/CommentSheetOptions.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/comments/CommentSheetOptions.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/comments/CommentSheetOptions.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/comments/CommentSheetOptions.java
+@@ -105,6 +105,9 @@ public final class CommentSheetOptions {
+     /** The member the report names once the video viewer's comment bar has built its GIF and sticker buttons. */
+     static final String VIEWER_BUTTONS = "video viewer comment buttons";
+ 
++    static final String VIEWER_COMPOSER = "video viewer comment composer";
++    static final String COMPOSER_HIDDEN = "Video comment composer hidden";
++
+     /** The member the report names once the socket under a post's comments has asked about Related groups. */
+     static final String BOTTOM = "related groups under comments";
+ 
+@@ -205,6 +207,24 @@ public final class CommentSheetOptions {
+         }
+     }
+ 
++    /**
++     * The hook immediately before the full-screen video's comment bar returns its rendered object.
++     * True replaces that object with null while Hide the video comment box is on; false preserves
++     * Facebook's original render result.
++     */
++    public static boolean hidesVideoCommentComposer() {
++        try {
++            HookStatus.invoked(FAMILY);
++            HookStatus.bound(FAMILY, VIEWER_COMPOSER);
++            if (!Utils.settingsReady() || !Settings.HIDE_VIDEO_COMMENT_COMPOSER.get()) return false;
++            HookStatus.counted(FAMILY, COMPOSER_HIDDEN);
++            return true;
++        } catch (Throwable failure) {
++            HookStatus.threw(FAMILY, "video viewer comment composer", failure);
++            return false;
++        }
++    }
++
+     /**
+      * The hook, first thing in the check of what shows under a post's comments, handed the
+      * plugin's name. True answers no for the Related groups list while Hide related groups is on;
+diff --git a/patches/src/main/kotlin/app/morphe/patches/facebook/comments/options/CommentSheetOptionsPatch.kt b/patches/src/main/kotlin/app/morphe/patches/facebook/comments/options/CommentSheetOptionsPatch.kt
+--- a/patches/src/main/kotlin/app/morphe/patches/facebook/comments/options/CommentSheetOptionsPatch.kt
++++ b/patches/src/main/kotlin/app/morphe/patches/facebook/comments/options/CommentSheetOptionsPatch.kt
+@@ -90,5 +90,6 @@ internal const val COMMENT_SHEET_OPTIONS = "$EXTENSION_PACKAGE/comments/CommentS
+ internal const val HOLDS_BUTTON = "$COMMENT_SHEET_OPTIONS->holdsButton(Ljava/lang/String;)Z"
+ internal const val HOLDS_VIEWER_BUTTONS = "$COMMENT_SHEET_OPTIONS->holdsViewerButtons()Z"
++internal const val HIDES_VIDEO_COMMENT_COMPOSER = "$COMMENT_SHEET_OPTIONS->hidesVideoCommentComposer()Z"
+ internal const val HOLDS_BOTTOM_CONTENT = "$COMMENT_SHEET_OPTIONS->holdsBottomContent(Ljava/lang/String;)Z"
+ internal const val SKIP_PICKER = "$COMMENT_SHEET_OPTIONS->skipReactionPicker()Z"
+ internal const val OPEN_REPLY_THREADS = "$COMMENT_SHEET_OPTIONS->openReplyThreads(Z)Z"
+@@ -166,7 +167,9 @@ val commentSheetOptionsPatch = bytecodePatch(
+         mutableClassDefBy(replyList.build.definingClass).methods.single { it.descriptor() == replyList.build.descriptor() }
+             .loadWholeReplyThreads(replyList)
+-        mutableClassDefBy(viewer.render.definingClass).methods.single { it.descriptor() == viewer.render.descriptor() }
+-            .holdViewerButtons(viewer)
++        val viewerRender = mutableClassDefBy(viewer.render.definingClass).methods
++            .single { it.descriptor() == viewer.render.descriptor() }
++        viewerRender.holdViewerButtons(viewer)
++        viewerRender.hideVideoCommentComposer()
+         enableStatus("commentSheetOptions")
+     }
+ }
+@@ -789,3 +791,44 @@ internal fun MutableMethod.holdViewerButtons(buttons: ViewerButtons) {
+         ExternalLabel("bar", getInstruction(buttons.at)),
+     )
+ }
++
++/**
++ * On a yes, the full-screen video viewer's comment bar returns no rendered object. Insert the
++ * check immediately before each object return, so every normal return path is covered without
++ * guessing which register Facebook uses for the composer. A free local register below v16 is
++ * needed by if-eqz; refuse to patch if there isn't one.
++ */
++internal fun MutableMethod.hideVideoCommentComposer() {
++    if (!returnType.startsWith("L") && !returnType.startsWith("[")) {
++        refuse("$descriptor() doesn't return an object")
++    }
++    val original = implementation?.instructions?.toList().orEmpty()
++    val returns = original.indices.filter { original[it].opcode == Opcode.RETURN_OBJECT }
++    if (returns.isEmpty()) refuse("$descriptor() has no return-object instruction")
++
++    // Insert from the end so the original indices before each insertion remain valid.
++    for (index in returns.asReversed()) {
++        val code = implementation!!.instructions
++        val returnedRegister = (code[index] as? OneRegisterInstruction)?.registerA
++            ?: refuse("$descriptor() has a return-object without a register")
++        val live = RegisterLiveness.of(this).liveInto(index)
++        val free = (0 until minOf(localRegisterCount(), 16))
++            .firstOrNull { it !in live && it != returnedRegister }
++            ?: refuse("$descriptor() has no free low register before return at instruction $index")
++        val clear = if (returnedRegister < 16) {
++            "const/4 v$returnedRegister, 0x0"
++        } else {
++            "const/16 v$returnedRegister, 0x0"
++        }
++        addInstructionsWithLabels(
++            index,
++            """
++                invoke-static {}, $HIDES_VIDEO_COMMENT_COMPOSER
++                move-result v$free
++                if-eqz v$free, :keep$index
++                $clear
++            """,
++            ExternalLabel("keep$index", getInstruction(index)),
++        )
++    }
++}
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SwitchLabels.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SwitchLabels.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SwitchLabels.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SwitchLabels.java
+@@ -82,5 +82,6 @@ final class SwitchLabels {
+         if (setting == Settings.HIDE_META_AI_SUMMARIES) return L10n.t("Hide Meta AI comment summaries");
+         if (setting == Settings.LIKE_ONLY) return L10n.t("Like only");
+         if (setting == Settings.HIDE_COMMENT_GIF_STICKER_BUTTONS) return L10n.t("Hide GIF and sticker buttons");
++        if (setting == Settings.HIDE_VIDEO_COMMENT_COMPOSER) return L10n.t("Hide the video comment box");
+         if (setting == Settings.OPEN_REPLY_THREADS) return L10n.t("Open every reply thread");
+         if (setting == Settings.LOAD_WHOLE_REPLY_THREADS) return L10n.t("Load whole reply threads");
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/FeedPages.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/FeedPages.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/FeedPages.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/FeedPages.java
+@@ -407,5 +407,7 @@ final class FeedPages {
+             comments.addPreference(toggle(context, Settings.HIDE_COMMENT_GIF_STICKER_BUTTONS,
+                     L10n.t("The comment box loses its GIF and sticker buttons. Typing, photos and posting work as before.")));
++            comments.addPreference(toggle(context, Settings.HIDE_VIDEO_COMMENT_COMPOSER,
++                    L10n.t("Hides the bottom comment box in Facebook's full-screen video viewer. Comment boxes on posts stay.")));
+             comments.addPreference(toggle(context, Settings.OPEN_REPLY_THREADS,
+                     L10n.t("Comments show their replies right away, so there's no View replies to tap.")));
+             comments.addPreference(toggle(context, Settings.LOAD_WHOLE_REPLY_THREADS,
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/PatchFamily.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/PatchFamily.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/PatchFamily.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/PatchFamily.java
+@@ -220,7 +220,8 @@ public enum PatchFamily {
+     COMMENT_SHEET_OPTIONS(FamilyNames.COMMENT_SHEET_OPTIONS, "commentSheetOptions", null,
+             Settings.LIKE_ONLY, Settings.HIDE_COMMENT_GIF_STICKER_BUTTONS, Settings.OPEN_REPLY_THREADS,
+             Settings.LOAD_WHOLE_REPLY_THREADS, Settings.HIDE_RELATED_GROUPS_UNDER_COMMENTS,
+             Settings.HIDE_SHOP_LINK_COMMENTS, Settings.HIDE_COMMENTS_WITH_WORDS,
+-            Settings.HIDE_INCOMING_COMMENT_TYPING, Settings.HIDE_NEW_COMMENTS_PILL),
++            Settings.HIDE_INCOMING_COMMENT_TYPING, Settings.HIDE_NEW_COMMENTS_PILL,
++            Settings.HIDE_VIDEO_COMMENT_COMPOSER),
+     FULL_HEIGHT_COMMENTS(FamilyNames.FULL_HEIGHT_COMMENTS, "fullHeightComments", null,
+             Settings.OPEN_COMMENTS_FULL_HEIGHT),
+diff --git a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SettingsBackup.java b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SettingsBackup.java
+--- a/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SettingsBackup.java
++++ b/extensions/facebook/src/main/java/app/morphe/extension/facebook/settings/SettingsBackup.java
+@@ -218,5 +218,6 @@ public final class SettingsBackup {
+             Settings.HIDE_INCOMING_COMMENT_TYPING,
+             Settings.HIDE_NEW_COMMENTS_PILL,
++            Settings.HIDE_VIDEO_COMMENT_COMPOSER,
+             Settings.OPEN_COMMENTS_FULL_HEIGHT,
+             Settings.TAG_SUGGESTIONS_ONLY_AFTER_AT,
+             Settings.TAP_TO_PLAY,
+diff --git a/extensions/facebook/src/test/java/app/morphe/extension/facebook/comments/CommentSheetOptionsTest.java b/extensions/facebook/src/test/java/app/morphe/extension/facebook/comments/CommentSheetOptionsTest.java
+--- a/extensions/facebook/src/test/java/app/morphe/extension/facebook/comments/CommentSheetOptionsTest.java
++++ b/extensions/facebook/src/test/java/app/morphe/extension/facebook/comments/CommentSheetOptionsTest.java
+@@ -50,6 +50,7 @@ public class CommentSheetOptionsTest {
+         PauseForTests.resume();
+         Settings.LIKE_ONLY.resetToDefault();
+         Settings.HIDE_COMMENT_GIF_STICKER_BUTTONS.resetToDefault();
++        Settings.HIDE_VIDEO_COMMENT_COMPOSER.resetToDefault();
+         Settings.OPEN_REPLY_THREADS.resetToDefault();
+         Settings.LOAD_WHOLE_REPLY_THREADS.resetToDefault();
+         Settings.HIDE_RELATED_GROUPS_UNDER_COMMENTS.resetToDefault();
+@@ -89,6 +90,20 @@ public class CommentSheetOptionsTest {
+                 + CommentSheetOptions.BUTTON_HIDDEN + " 1", statusLine());
+     }
+ 
++    @Test
++    public void videoCommentComposerUsesItsOwnSwitch() {
++        assertFalse("the video comment composer was hidden by default",
++                CommentSheetOptions.hidesVideoCommentComposer());
++        Settings.LIKE_ONLY.save(true);
++        assertFalse("Like only hid the video comment composer",
++                CommentSheetOptions.hidesVideoCommentComposer());
++        Settings.HIDE_VIDEO_COMMENT_COMPOSER.save(true);
++        assertTrue("the video comment composer stayed visible",
++                CommentSheetOptions.hidesVideoCommentComposer());
++        assertEquals(FamilyNames.COMMENT_SHEET_OPTIONS + ": invoked 3, 1 found, 0 missing. Counted: "
++                + CommentSheetOptions.COMPOSER_HIDDEN + " 1", statusLine());
++    }
++
+     @Test
+     public void onEveryReplyThreadStartsOpenAndIsCounted() {
+         Settings.OPEN_REPLY_THREADS.save(true);
+diff --git a/patches/src/test/kotlin/app/morphe/patches/facebook/comments/options/CommentSheetOptionsFixtureTest.kt b/patches/src/test/kotlin/app/morphe/patches/facebook/comments/options/CommentSheetOptionsFixtureTest.kt
+--- a/patches/src/test/kotlin/app/morphe/patches/facebook/comments/options/CommentSheetOptionsFixtureTest.kt
++++ b/patches/src/test/kotlin/app/morphe/patches/facebook/comments/options/CommentSheetOptionsFixtureTest.kt
+@@ -337,4 +337,42 @@ class CommentSheetOptionsFixtureTest {
+     }
+ 
++    private fun videoComposer(bundle: File) {
++        val found = viewerButtons(holders(bundle, VIEWER_GIF))
++        val render = found.render
++        val where = "${bundle.name}: ${render.descriptor()}"
++        val bar = FixtureDex.classes(bundle, setOf(render.definingClass)).values.single()
++        val context = PatchContexts.of(listOf(bar))
++        val method = context.mutableClassDefBy(bar.type).methods.single { it.descriptor() == render.descriptor() }
++        val original = method.implementation!!.instructions.toList()
++        val returnCount = original.count { it.opcode == Opcode.RETURN_OBJECT }
++        assertTrue("$where has no object return to hook", returnCount > 0)
++
++        method.hideVideoCommentComposer()
++        val patched = method.implementation!!.instructions.toList()
++        assertEquals("$where gains four instructions before each object return",
++            original.size + returnCount * 4, patched.size)
++        val hooks = patched.indices.filter {
++            patched[it].opcode == Opcode.INVOKE_STATIC && patched[it].reference() == HIDES_VIDEO_COMMENT_COMPOSER
++        }
++        assertEquals("$where hooks every object return", returnCount, hooks.size)
++        for (index in hooks) {
++            assertEquals("$where asks for the setting", Opcode.MOVE_RESULT, patched[index + 1].opcode)
++            assertEquals("$where checks the setting", Opcode.IF_EQZ, patched[index + 2].opcode)
++            assertTrue("$where clears the result only on a yes",
++                patched[index + 3].opcode in setOf(Opcode.CONST_4, Opcode.CONST_16))
++            assertEquals("$where branches back to its original return", index + 4,
++                (patched[index + 2] as BuilderOffsetInstruction).target.location.index)
++            assertEquals("$where preserves the original return", Opcode.RETURN_OBJECT, patched[index + 4].opcode)
++            assertEquals("$where clears the returned register",
++                (patched[index + 4] as OneRegisterInstruction).registerA,
++                (patched[index + 3] as OneRegisterInstruction).registerA)
++        }
++    }
++
++    @Test
++    fun `each declared build can hide the full-screen video comment composer`() = bundles { bundle ->
++        videoComposer(bundle)
++    }
++
+     @Test
+     fun `each declared build keeps the GIF and sticker buttons out of the video viewer's comment bar`() = bundles { bundle ->
+         viewer(bundle)
+diff --git a/extensions/shared/library/src/main/l10n/tr.tsv b/extensions/shared/library/src/main/l10n/tr.tsv
+--- a/extensions/shared/library/src/main/l10n/tr.tsv
++++ b/extensions/shared/library/src/main/l10n/tr.tsv
+@@ -1,2 +1,6 @@
+ # Turkish for Hushfacebook: the English key, a tab, the translation. One row per string.
+ # After editing, run python scripts/gen-l10n.py from the repository root.
++# context: switch title under Comments; affects only the full-screen video's bottom comment composer
++Hide the video comment box	Video izlerken yorum alanını gizle
++# context: summary of the switch; comment boxes on ordinary posts stay visible
++Hides the bottom comment box in Facebook's full-screen video viewer. Comment boxes on posts stay.	Facebook'un tam ekran video oynatıcısının altındaki yorum alanını gizler. Gönderilerdeki yorum alanları kalır.
